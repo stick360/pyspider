@@ -85,7 +85,7 @@ class Response(object):
 
         # Fallback to auto-detected encoding.
         if not encoding and chardet is not None:
-            encoding = chardet.detect(self.content)['encoding']
+            encoding = chardet.detect(self.content[:600])['encoding']
 
         if encoding and encoding.lower() == 'gb2312':
             encoding = 'gb18030'
@@ -151,7 +151,7 @@ class Response(object):
             return self._doc
         elements = self.etree
         doc = self._doc = PyQuery(elements)
-        doc.make_links_absolute(self.url)
+        doc.make_links_absolute(utils.text(self.url))
         return doc
 
     @property

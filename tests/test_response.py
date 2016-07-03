@@ -30,7 +30,7 @@ class TestResponse(unittest.TestCase):
     @classmethod
     def setUpClass(self):
         self.fetcher = Fetcher(None, None, async=False)
-        self.httpbin_thread = utils.run_in_subprocess(httpbin.app.run, port=14887)
+        self.httpbin_thread = utils.run_in_subprocess(httpbin.app.run, port=14887, passthrough_errors=False)
         self.httpbin = 'http://127.0.0.1:14887'
         time.sleep(0.5)
 
@@ -44,7 +44,7 @@ class TestResponse(unittest.TestCase):
         request = copy.deepcopy(self.sample_task_http)
         request['url'] = url
         request.update(kwargs)
-        task, result = self.fetcher.fetch(request)
+        result = self.fetcher.fetch(request)
         response = rebuild_response(result)
         return response
 

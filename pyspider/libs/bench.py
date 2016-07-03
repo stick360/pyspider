@@ -177,6 +177,13 @@ def bench_test_message_queue(queue):
         if hasattr(queue, 'channel'):
             queue.channel.queue_purge(queue.name)
 
+        # clear message queue
+        try:
+            while queue.get(False):
+                continue
+        except Queue.Empty:
+            pass
+
 
 class BenchMixin(object):
     """Report to logger for bench test"""
@@ -205,7 +212,6 @@ class BenchScheduler(Scheduler, BenchMixin):
     def __init__(self, *args, **kwargs):
         super(BenchScheduler, self).__init__(*args, **kwargs)
         self._bench_init()
-        self.trigger_on_start('__bench_test__')
 
     def on_task_status(self, task):
         self._bench_report('Crawled')

@@ -27,7 +27,7 @@ class TestFetcherProcessor(unittest.TestCase):
         self.status_queue = Queue()
         self.newtask_queue = Queue()
         self.result_queue = Queue()
-        self.httpbin_thread = utils.run_in_subprocess(httpbin.app.run, port=14887)
+        self.httpbin_thread = utils.run_in_subprocess(httpbin.app.run, port=14887, passthrough_errors=False)
         self.httpbin = 'http://127.0.0.1:14887'
         self.proxy_thread = subprocess.Popen(['pyproxy', '--username=binux',
                                               '--password=123456', '--port=14830',
@@ -60,7 +60,7 @@ class TestFetcherProcessor(unittest.TestCase):
         if isinstance(task, list):
             task = task[0]
         task['track'] = track
-        task, result = self.fetcher.fetch(task)
+        result = self.fetcher.fetch(task)
         self.processor.on_task(task, result)
 
         status = None
@@ -276,8 +276,8 @@ class TestFetcherProcessor(unittest.TestCase):
         self.assertFalse(newtasks)
         self.assertFalse(result)
 
-    def test_a170_last_modifed(self):
-        status, newtasks, result = self.crawl(self.httpbin+'/cache', last_modifed='0', callback=self.json)
+    def test_a170_last_modified(self):
+        status, newtasks, result = self.crawl(self.httpbin+'/cache', last_modified='0', callback=self.json)
 
         self.assertStatusOk(status)
         self.assertFalse(newtasks)

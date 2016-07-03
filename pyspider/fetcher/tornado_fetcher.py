@@ -26,7 +26,9 @@ from six.moves.urllib.parse import urljoin, urlsplit
 from tornado import gen
 from tornado.curl_httpclient import CurlAsyncHTTPClient
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
+
 from pyspider.libs import utils, dataurl, counter
+from pyspider.libs.url import quote_chinese
 from .cookie_utils import extract_cookies_to_jar
 logger = logging.getLogger('fetcher')
 
@@ -66,6 +68,7 @@ class Fetcher(object):
         },
         'use_gzip': True,
         'timeout': 120,
+        'connect_timeout': 20,
     }
     phantomjs_proxy = None
     robot_txt_age = 60*60  # 1h
@@ -118,18 +121,24 @@ class Fetcher(object):
         if callback is None:
             callback = self.send_result
 
+        type = 'None'
         try:
             if url.startswith('data:'):
-                ret = yield gen.maybe_future(self.data_fetch(url, task, callback))
+                type = 'data'
+                result = yield gen.maybe_future(self.data_fetch(url, task))
             elif task.get('fetch', {}).get('fetch_type') in ('js', 'phantomjs'):
-                ret = yield self.phantomjs_fetch(url, task, callback)
+                type = 'phantomjs'
+                result = yield self.phantomjs_fetch(url, task)
             else:
-                ret = yield self.http_fetch(url, task, callback)
+                type = 'http'
+                result = yield self.http_fetch(url, task)
         except Exception as e:
             logger.exception(e)
-            raise e
+            result = self.handle_error(type, url, task, e)
 
-        raise gen.Return(ret)
+        callback(type, task, result)
+        self.on_result(type, task, result)
+        raise gen.Return(result)
 
     def sync_fetch(self, task):
         '''Synchronization fetch, usually used in xmlrpc thread'''
@@ -148,13 +157,13 @@ class Fetcher(object):
             wait_result.release()
 
         wait_result.acquire()
-        self.fetch(task, callback=callback)
+        self.ioloop.add_callback(self.fetch, task, callback)
         while 'result' not in _result:
             wait_result.wait()
         wait_result.release()
         return _result['result']
 
-    def data_fetch(self, url, task, callback):
+    def data_fetch(self, url, task):
         '''A fake fetcher for dataurl'''
         self.on_fetch('data', task)
         result = {}
@@ -176,11 +185,9 @@ class Fetcher(object):
                 len(result['content'])
             )
 
-        callback('data', task, result)
-        self.on_result('data', task, result)
-        return task, result
+        return result
 
-    def handle_error(self, type, url, task, start_time, callback, error):
+    def handle_error(self, type, url, task, start_time, error):
         result = {
             'status_code': getattr(error, 'code', 599),
             'error': utils.text(error),
@@ -188,13 +195,12 @@ class Fetcher(object):
             'time': time.time() - start_time,
             'orig_url': url,
             'url': url,
+            "save": task.get('fetch', {}).get('save')
         }
         logger.error("[%d] %s:%s %s, %r %.2fs",
                      result['status_code'], task.get('project'), task.get('taskid'),
                      url, error, result['time'])
-        callback(type, task, result)
-        self.on_result(type, task, result)
-        return task, result
+        return result
 
     allowed_options = ['method', 'data', 'timeout', 'cookies', 'use_gzip', 'validate_cert']
 
@@ -226,17 +232,15 @@ class Fetcher(object):
             if '://' not in proxy_string:
                 proxy_string = 'http://' + proxy_string
             proxy_splited = urlsplit(proxy_string)
+            fetch['proxy_host'] = proxy_splited.hostname
             if proxy_splited.username:
                 fetch['proxy_username'] = proxy_splited.username
-                if six.PY2:
-                    fetch['proxy_username'] = fetch['proxy_username'].encode('utf8')
             if proxy_splited.password:
                 fetch['proxy_password'] = proxy_splited.password
-                if six.PY2:
-                    fetch['proxy_password'] = fetch['proxy_password'].encode('utf8')
-            fetch['proxy_host'] = proxy_splited.hostname.encode('utf8')
             if six.PY2:
-                fetch['proxy_host'] = fetch['proxy_host'].encode('utf8')
+                for key in ('proxy_host', 'proxy_username', 'proxy_password'):
+                    if key in fetch:
+                        fetch[key] = fetch[key].encode('utf8')
             fetch['proxy_port'] = proxy_splited.port or 8080
 
         # etag
@@ -249,17 +253,18 @@ class Fetcher(object):
             if _t and 'If-None-Match' not in fetch['headers']:
                 fetch['headers']['If-None-Match'] = _t
         # last modifed
-        if task_fetch.get('last_modified', True):
+        if task_fetch.get('last_modified', task_fetch.get('last_modifed', True)):
+            last_modified = task_fetch.get('last_modified', task_fetch.get('last_modifed', True))
             _t = None
-            if isinstance(task_fetch.get('last_modifed'), six.string_types):
-                _t = task_fetch.get('last_modifed')
+            if isinstance(last_modified, six.string_types):
+                _t = last_modified
             elif track_ok:
                 _t = track_headers.get('last-modified')
             if _t and 'If-Modified-Since' not in fetch['headers']:
                 fetch['headers']['If-Modified-Since'] = _t
         # timeout
         if 'timeout' in fetch:
-            fetch['connect_timeout'] = fetch['request_timeout'] = fetch['timeout']
+            fetch['request_timeout'] = fetch['timeout']
             del fetch['timeout']
         # data rename to body
         if 'data' in fetch:
@@ -306,12 +311,11 @@ class Fetcher(object):
                 del self.robots_txt_cache[domain]
 
     @gen.coroutine
-    def http_fetch(self, url, task, callback):
+    def http_fetch(self, url, task):
         '''HTTP fetcher'''
         start_time = time.time()
-
         self.on_fetch('http', task)
-        handle_error = lambda x: self.handle_error('http', url, task, start_time, callback, x)
+        handle_error = lambda x: self.handle_error('http', url, task, start_time, x)
 
         # setup request parameters
         fetch = self.pack_tornado_request_parameters(url, task)
@@ -347,9 +351,15 @@ class Fetcher(object):
 
             try:
                 request = tornado.httpclient.HTTPRequest(**fetch)
+                # if cookie already in header, get_cookie_header wouldn't work
+                old_cookie_header = request.headers.get('Cookie')
+                if old_cookie_header:
+                    del request.headers['Cookie']
                 cookie_header = cookies.get_cookie_header(session, request)
                 if cookie_header:
                     request.headers['Cookie'] = cookie_header
+                elif old_cookie_header:
+                    request.headers['Cookie'] = old_cookie_header
             except Exception as e:
                 logger.exception(fetch)
                 raise gen.Return(handle_error(e))
@@ -375,11 +385,10 @@ class Fetcher(object):
                     fetch['method'] = 'GET'
                     if 'body' in fetch:
                         del fetch['body']
-                fetch['url'] = urljoin(fetch['url'], response.headers['Location'])
+                fetch['url'] = quote_chinese(urljoin(fetch['url'], response.headers['Location']))
                 fetch['request_timeout'] -= time.time() - start_time
                 if fetch['request_timeout'] < 0:
                     fetch['request_timeout'] = 0.1
-                fetch['connect_timeout'] = fetch['request_timeout']
                 max_redirects -= 1
                 continue
 
@@ -389,8 +398,8 @@ class Fetcher(object):
             result['headers'] = dict(response.headers)
             result['status_code'] = response.code
             result['url'] = response.effective_url or url
-            result['cookies'] = session.get_dict()
             result['time'] = time.time() - start_time
+            result['cookies'] = session.get_dict()
             result['save'] = task_fetch.get('save')
             if response.error:
                 result['error'] = utils.text(response.error)
@@ -403,17 +412,14 @@ class Fetcher(object):
                                task.get('project'), task.get('taskid'),
                                url, result['time'])
 
-            callback('http', task, result)
-            self.on_result('http', task, result)
-            raise gen.Return((task, result))
+            raise gen.Return(result)
 
     @gen.coroutine
-    def phantomjs_fetch(self, url, task, callback):
+    def phantomjs_fetch(self, url, task):
         '''Fetch with phantomjs proxy'''
         start_time = time.time()
-
         self.on_fetch('phantomjs', task)
-        handle_error = lambda x: self.handle_error('phantomjs', url, task, start_time, callback, x)
+        handle_error = lambda x: self.handle_error('phantomjs', url, task, start_time, x)
 
         # check phantomjs proxy is enabled
         if not self.phantomjs_proxy:
@@ -423,14 +429,12 @@ class Fetcher(object):
                 "headers": {},
                 "status_code": 501,
                 "url": url,
+                "time": time.time() - start_time,
                 "cookies": {},
-                "time": 0,
                 "save": task.get('fetch', {}).get('save')
             }
             logger.warning("[501] %s:%s %s 0s", task.get('project'), task.get('taskid'), url)
-            callback('http', task, result)
-            self.on_result('http', task, result)
-            raise gen.Return((task, result))
+            raise gen.Return(result)
 
         # setup request parameters
         fetch = self.pack_tornado_request_parameters(url, task)
@@ -450,7 +454,7 @@ class Fetcher(object):
         request_conf = {
             'follow_redirects': False
         }
-        request_conf['connect_timeout'] = fetch.get('connect_timeout', 120)
+        request_conf['connect_timeout'] = fetch.get('connect_timeout', 20)
         request_conf['request_timeout'] = fetch.get('request_timeout', 120)
 
         session = cookies.RequestsCookieJar()
@@ -481,6 +485,7 @@ class Fetcher(object):
         if not response.body:
             raise gen.Return(handle_error(Exception('no response from phantomjs')))
 
+        result = {}
         try:
             result = json.loads(utils.text(response.body))
         except Exception as e:
@@ -496,9 +501,7 @@ class Fetcher(object):
                          task.get('project'), task.get('taskid'),
                          url, result['content'], result['time'])
 
-        callback('phantomjs', task, result)
-        self.on_result('phantomjs', task, result)
-        raise gen.Return((task, result))
+        raise gen.Return(result)
 
     def run(self):
         '''Run loop'''
@@ -541,7 +544,10 @@ class Fetcher(object):
         '''Quit fetcher'''
         self._running = False
         self._quit = True
-        self.ioloop.stop()
+        self.ioloop.add_callback(self.ioloop.stop)
+        if hasattr(self, 'xmlrpc_server'):
+            self.xmlrpc_ioloop.add_callback(self.xmlrpc_server.stop)
+            self.xmlrpc_ioloop.add_callback(self.xmlrpc_ioloop.stop)
 
     def size(self):
         return self.http_client.size()
@@ -549,34 +555,36 @@ class Fetcher(object):
     def xmlrpc_run(self, port=24444, bind='127.0.0.1', logRequests=False):
         '''Run xmlrpc server'''
         import umsgpack
+        from pyspider.libs.wsgi_xmlrpc import WSGIXMLRPCApplication
         try:
-            from xmlrpc.server import SimpleXMLRPCServer
             from xmlrpc.client import Binary
         except ImportError:
-            from SimpleXMLRPCServer import SimpleXMLRPCServer
             from xmlrpclib import Binary
 
-        server = SimpleXMLRPCServer((bind, port), allow_none=True, logRequests=logRequests)
-        server.register_introspection_functions()
-        server.register_multicall_functions()
+        application = WSGIXMLRPCApplication()
 
-        server.register_function(self.quit, '_quit')
-        server.register_function(self.size)
+        application.register_function(self.quit, '_quit')
+        application.register_function(self.size)
 
         def sync_fetch(task):
             result = self.sync_fetch(task)
             result = Binary(umsgpack.packb(result))
             return result
-        server.register_function(sync_fetch, 'fetch')
+        application.register_function(sync_fetch, 'fetch')
 
         def dump_counter(_time, _type):
             return self._cnt[_time].to_dict(_type)
-        server.register_function(dump_counter, 'counter')
+        application.register_function(dump_counter, 'counter')
 
-        server.timeout = 0.5
-        while not self._quit:
-            server.handle_request()
-        server.server_close()
+        import tornado.wsgi
+        import tornado.ioloop
+        import tornado.httpserver
+
+        container = tornado.wsgi.WSGIContainer(application)
+        self.xmlrpc_ioloop = tornado.ioloop.IOLoop()
+        self.xmlrpc_server = tornado.httpserver.HTTPServer(container, io_loop=self.xmlrpc_ioloop)
+        self.xmlrpc_server.listen(port=port, address=bind)
+        self.xmlrpc_ioloop.start()
 
     def on_fetch(self, type, task):
         '''Called before task fetch'''
@@ -590,7 +598,7 @@ class Fetcher(object):
         self._cnt['5m'].event((task.get('project'), status_code), +1)
         self._cnt['1h'].event((task.get('project'), status_code), +1)
 
-        if type == 'http' and result.get('time'):
+        if type in ('http', 'phantomjs') and result.get('time'):
             content_len = len(result.get('content', ''))
             self._cnt['5m'].event((task.get('project'), 'speed'),
                                   float(content_len) / result.get('time'))

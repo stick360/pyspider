@@ -58,7 +58,7 @@ class QuitableFlask(Flask):
         try:
             from .webdav import dav_app
         except ImportError as e:
-            logger.error('WebDav interface not enabled: %r', e)
+            logger.warning('WebDav interface not enabled: %r', e)
             dav_app = None
         if dav_app:
             from werkzeug.wsgi import DispatcherMiddleware
@@ -67,19 +67,20 @@ class QuitableFlask(Flask):
             })
 
         container = tornado.wsgi.WSGIContainer(application)
-        http_server = tornado.httpserver.HTTPServer(container)
-        http_server.listen(port, hostname)
+        self.http_server = tornado.httpserver.HTTPServer(container)
+        self.http_server.listen(port, hostname)
         if use_reloader:
             from tornado import autoreload
             autoreload.start()
 
         self.logger.info('webui running on %s:%s', hostname, port)
-        tornado.ioloop.IOLoop.current().start()
+        self.ioloop = tornado.ioloop.IOLoop.current()
+        self.ioloop.start()
 
     def quit(self):
-        import tornado.ioloop
-
-        tornado.ioloop.IOLoop.current().stop()
+        if hasattr(self, 'ioloop'):
+            self.ioloop.add_callback(self.http_server.stop)
+            self.ioloop.add_callback(self.ioloop.stop)
         self.logger.info('webui exiting...')
 
 
@@ -91,7 +92,7 @@ app.jinja_env.line_statement_prefix = '#'
 app.jinja_env.globals.update(builtins.__dict__)
 
 app.config.update({
-    'fetch': lambda x: tornado_fetcher.Fetcher(None, None, async=False).fetch(x)[1],
+    'fetch': lambda x: tornado_fetcher.Fetcher(None, None, async=False).fetch(x),
     'taskdb': None,
     'projectdb': None,
     'scheduler_rpc': None,
